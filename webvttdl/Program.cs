@@ -222,6 +222,7 @@ namespace webvttdl
                 }
 
                 // Download all segments into RAM.
+                int maxRetries = opts.Retries > 0 ? opts.Retries : 3;
                 var segmentContents = new List<string>(segmentUrls.Count);
                 int failed = 0;
                 for (int j = 0; j < segmentUrls.Count; j++)
@@ -229,7 +230,7 @@ namespace webvttdl
                     Console.Write(string.Format(
                         "\r  Downloading segment {0}/{1}...    ", j + 1, segmentUrls.Count));
 
-                    string segContent = curl.DownloadString(segmentUrls[j]);
+                    string segContent = DownloadWithRetry(curl, segmentUrls[j], j, maxRetries);
                     if (segContent == null)
                     {
                         failed++;
@@ -289,18 +290,22 @@ namespace webvttdl
             string srtPath = Path.Combine(outDir, baseName + ".srt");
 
             var merger = new WebVttMerger.IncrementalMerger();
-
-            // Total segment counter (for status display and final summary).
-            int totalSegments = 0;
-
-            // Highest sequence number already downloaded (-1 = none yet).
-            long lastSeenSeq = -1;
-
-            // Segments that failed all inline retries: seqNum -> url.
-            // Retried at the start of each poll while still within the CDN window.
-            var retryQueue = new Dictionary<long, string>();
-
             int maxRetries = opts.Retries > 0 ? opts.Retries : 3;
+
+            // pendingBuffer: successfully downloaded content, held until all earlier
+            // sequence numbers are resolved so we always flush in order.
+            var pendingBuffer = new SortedDictionary<long, string>();
+
+            // retryQueue: segments still failing after inline retries — seqNum -> url.
+            var retryQueue = new SortedDictionary<long, string>();
+
+            // gapSet: sequences permanently lost (expired from CDN window).
+            // Treated as empty segments when flushing so later seqs can unblock.
+            var gapSet = new System.Collections.Generic.HashSet<long>();
+
+            long lastSeenSeq    = initialInfo.FirstSequenceNumber - 1; // highest seq attempted
+            long lastFlushedSeq = initialInfo.FirstSequenceNumber - 1; // highest seq flushed
+            int  totalSegments  =  0;
 
             DateTime? stopAt = opts.Duration > 0
                 ? (DateTime?)DateTime.UtcNow.AddSeconds(opts.Duration)
@@ -322,6 +327,7 @@ namespace webvttdl
                     break;
                 }
 
+                // --- Refresh the media playlist ---
                 if (!firstPoll)
                 {
                     string playlistContent = curl.DownloadString(track.ResolvedPlaylistUrl);
@@ -335,83 +341,85 @@ namespace webvttdl
                 }
                 firstPoll = false;
 
-                // --- Retry queue: re-attempt previously failed segments still in window ---
-                if (retryQueue.Count > 0)
+                // --- Expire segments that fell off the CDN window ---
+                long windowStart = info.FirstSequenceNumber;
+                var toExpire = new List<long>();
+                foreach (long seq in retryQueue.Keys)
+                    if (seq < windowStart) toExpire.Add(seq);
+                foreach (long seq in toExpire)
                 {
-                    long windowStart = info.FirstSequenceNumber;
-                    var expired = new List<long>();
-                    foreach (long seq in retryQueue.Keys)
-                        if (seq < windowStart) expired.Add(seq);
-                    foreach (long seq in expired)
-                    {
-                        Console.Error.WriteLine(string.Format(
-                            "\n  WARNING: Segment seq={0} expired from CDN window, giving up.", seq));
-                        retryQueue.Remove(seq);
-                    }
+                    Console.Error.WriteLine(string.Format(
+                        "\n  WARNING: Segment seq={0} expired from CDN window, lost.", seq));
+                    gapSet.Add(seq);
+                    retryQueue.Remove(seq);
+                }
 
-                    // Sort so we insert them in order.
-                    var retrySeqs = new List<long>(retryQueue.Keys);
-                    retrySeqs.Sort();
-                    var recovered = new SortedDictionary<long, string>();
-                    foreach (long seq in retrySeqs)
+                // --- Retry queued segments ---
+                var retryKeys = new List<long>(retryQueue.Keys);
+                foreach (long seq in retryKeys)
+                {
+                    if (_cancelled) break;
+                    string content = DownloadWithRetry(curl, retryQueue[seq], seq, maxRetries);
+                    if (content != null)
                     {
-                        if (_cancelled) break;
-                        string content = DownloadWithRetry(curl, retryQueue[seq], seq, maxRetries);
-                        if (content != null)
-                        {
-                            recovered[seq] = content;
-                            retryQueue.Remove(seq);
-                        }
-                    }
-                    if (recovered.Count > 0)
-                    {
-                        // Insert recovered segments in order before the next normal batch.
-                        var recoveredList = new List<string>(recovered.Values);
-                        totalSegments += recoveredList.Count;
-                        merger.AddSegments(recoveredList);
-                        Console.Write(string.Format(
-                            "\r  Recovered {0} queued segment(s) | cues: {1}    ",
-                            recovered.Count, merger.CueCount));
+                        pendingBuffer[seq] = content;
+                        retryQueue.Remove(seq);
                     }
                 }
 
-                // --- Download any segments whose sequence number we haven't seen yet ---
-                var newBatch = new List<string>();
+                // --- Download new segments ---
                 for (int j = 0; j < info.SegmentUrls.Count && !_cancelled; j++)
                 {
                     long seqNum = info.FirstSequenceNumber + j;
-                    if (seqNum <= lastSeenSeq)
-                        continue;
+                    if (seqNum <= lastSeenSeq) continue;
 
                     string segContent = DownloadWithRetry(curl, info.SegmentUrls[j], seqNum, maxRetries);
-                    if (segContent == null)
-                    {
-                        // Still failing after all retries — queue for next poll attempt.
-                        retryQueue[seqNum] = info.SegmentUrls[j];
-                    }
+                    if (segContent != null)
+                        pendingBuffer[seqNum] = segContent;
                     else
-                    {
-                        newBatch.Add(segContent);
-                    }
-                    // Advance lastSeenSeq so we don't re-attempt via normal path.
+                        retryQueue[seqNum] = info.SegmentUrls[j];
+
                     lastSeenSeq = seqNum;
                 }
 
-                if (newBatch.Count > 0)
+                // --- Flush contiguous segments in order ---
+                // Advance past gaps (lost segments) and flush downloaded ones.
+                var flushBatch = new List<string>();
+                while (true)
                 {
-                    totalSegments += newBatch.Count;
-                    merger.AddSegments(newBatch);
+                    long next = lastFlushedSeq + 1;
+                    if (gapSet.Contains(next))
+                    {
+                        gapSet.Remove(next);
+                        lastFlushedSeq = next; // skip the gap
+                    }
+                    else if (pendingBuffer.ContainsKey(next))
+                    {
+                        flushBatch.Add(pendingBuffer[next]);
+                        pendingBuffer.Remove(next);
+                        lastFlushedSeq = next;
+                    }
+                    else
+                    {
+                        break; // hole still present — wait for retry or expiry
+                    }
+                }
 
-                    Console.Write(string.Format(
-                        "\r  +{0} segment(s) | total: {1} | cues: {2} | last seq: {3}    ",
-                        newBatch.Count, totalSegments, merger.CueCount, lastSeenSeq));
+                if (flushBatch.Count > 0)
+                {
+                    totalSegments += flushBatch.Count;
+                    merger.AddSegments(flushBatch);
 
-                    // Only process new segments; emit accumulated cues.
                     string mergedVtt = merger.ToVtt();
                     if (!opts.NoVtt)
                         File.WriteAllText(vttPath, mergedVtt, new UTF8Encoding(false));
                     if (!opts.NoSrt)
                         WebVttToSrtConverter.Convert(mergedVtt, srtPath);
+
+                    Console.Write(string.Format(
+                        "\r  +{0} seg | total: {1} | cues: {2} | seq: {3} | queued: {4}    ",
+                        flushBatch.Count, totalSegments, merger.CueCount,
+                        lastFlushedSeq, retryQueue.Count));
                 }
 
                 // If the server sent EXT-X-ENDLIST the stream has ended.
@@ -422,10 +430,8 @@ namespace webvttdl
                     break;
                 }
 
-                if (_cancelled)
-                    break;
+                if (_cancelled) break;
 
-                // Sleep until next playlist refresh, waking every 250 ms to check for cancellation.
                 int sleepMs = (opts.PollInterval > 0 ? opts.PollInterval : info.TargetDuration) * 1000;
                 SleepCancellable(sleepMs);
             }
