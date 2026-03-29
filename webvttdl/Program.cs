@@ -146,8 +146,32 @@ namespace webvttdl
 
             if (tracks.Count == 0)
             {
-                Log("No subtitle tracks found in the master playlist.");
-                return 0;
+                // No subtitle tracks found — check if the URL is itself a media playlist
+                // (user passed a subtitle .m3u8 directly instead of a master index.m3u8).
+                var directInfo = M3u8Parser.ParseMediaPlaylistInfo(masterContent, opts.Url);
+                if (directInfo.SegmentUrls.Count > 0 || directInfo.FirstSequenceNumber > 0)
+                {
+                    Log("URL appears to be a subtitle media playlist — using it directly.");
+                    string directUri = opts.Url.Substring(opts.Url.LastIndexOf('/') + 1);
+                    int q = directUri.IndexOf('?');
+                    if (q >= 0) directUri = directUri.Substring(0, q);
+                    tracks = new List<SubtitleTrack>
+                    {
+                        new SubtitleTrack
+                        {
+                            Uri = directUri,
+                            Language = "und",
+                            Name = "subtitles",
+                            GroupId = string.Empty,
+                            ResolvedPlaylistUrl = opts.Url
+                        }
+                    };
+                }
+                else
+                {
+                    Log("No subtitle tracks found in the master playlist.");
+                    return 0;
+                }
             }
 
             // Apply language filter if requested.
