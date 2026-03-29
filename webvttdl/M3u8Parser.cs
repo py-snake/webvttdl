@@ -12,6 +12,15 @@ namespace webvttdl
         public string ResolvedPlaylistUrl;
     }
 
+    // Richer result from parsing a media (subtitle) playlist.
+    public class MediaPlaylistInfo
+    {
+        public List<string> SegmentUrls;
+        public long FirstSequenceNumber;  // from #EXT-X-MEDIA-SEQUENCE, or 0
+        public int TargetDuration;        // from #EXT-X-TARGETDURATION, or 8
+        public bool IsLive;               // true when #EXT-X-ENDLIST is absent
+    }
+
     public static class M3u8Parser
     {
         // Parses master M3U8 content and returns all SUBTITLES tracks with resolved URLs.
@@ -60,21 +69,50 @@ namespace webvttdl
         // Parses a media (subtitle) M3U8 playlist and returns absolute segment URLs.
         public static List<string> ParseMediaPlaylist(string content, string playlistUrl)
         {
-            var result = new List<string>();
-            if (string.IsNullOrEmpty(content))
-                return result;
+            return ParseMediaPlaylistInfo(content, playlistUrl).SegmentUrls;
+        }
 
-            string[] lines = content.Split('\n');
-            foreach (string rawLine in lines)
+        // Parses a media playlist and returns full info including sequence number,
+        // target duration, live flag, and resolved segment URLs.
+        public static MediaPlaylistInfo ParseMediaPlaylistInfo(string content, string playlistUrl)
+        {
+            var info = new MediaPlaylistInfo
+            {
+                SegmentUrls = new List<string>(),
+                FirstSequenceNumber = 0,
+                TargetDuration = 8,
+                IsLive = true   // assumed live until #EXT-X-ENDLIST is seen
+            };
+
+            if (string.IsNullOrEmpty(content))
+                return info;
+
+            foreach (string rawLine in content.Split('\n'))
             {
                 string line = rawLine.Trim();
-                if (string.IsNullOrEmpty(line))
-                    continue;
-                if (line.StartsWith("#"))
-                    continue;
-                result.Add(ResolveUrl(playlistUrl, line));
+
+                if (line.StartsWith("#EXT-X-MEDIA-SEQUENCE:", StringComparison.OrdinalIgnoreCase))
+                {
+                    long seq;
+                    if (long.TryParse(line.Substring("#EXT-X-MEDIA-SEQUENCE:".Length).Trim(), out seq))
+                        info.FirstSequenceNumber = seq;
+                }
+                else if (line.StartsWith("#EXT-X-TARGETDURATION:", StringComparison.OrdinalIgnoreCase))
+                {
+                    int dur;
+                    if (int.TryParse(line.Substring("#EXT-X-TARGETDURATION:".Length).Trim(), out dur))
+                        info.TargetDuration = dur;
+                }
+                else if (line.Equals("#EXT-X-ENDLIST", StringComparison.OrdinalIgnoreCase))
+                {
+                    info.IsLive = false;
+                }
+                else if (!string.IsNullOrEmpty(line) && !line.StartsWith("#"))
+                {
+                    info.SegmentUrls.Add(ResolveUrl(playlistUrl, line));
+                }
             }
-            return result;
+            return info;
         }
 
         // Resolves a possibly-relative URI against a base URL using System.Uri (RFC 3986).

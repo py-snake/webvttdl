@@ -55,6 +55,10 @@ webvttdl.exe [options] <master-m3u8-url>
 | `--curl-opts <flags>` | | Extra flags passed verbatim to every curl invocation. Use for proxies, authentication, timeouts, retries, etc. |
 | `--no-srt` | | Output `.vtt` only; skip SRT conversion. |
 | `--no-vtt` | | Output `.srt` only; do not write the `.vtt` file. |
+| `--live` | | Force live recording mode (normally auto-detected). |
+| `--duration <sec>` | | Stop live recording after N seconds. |
+| `--poll <sec>` | | Playlist refresh interval for live mode (default: `EXT-X-TARGETDURATION`). |
+| `--retries <n>` | | Per-segment retry attempts on network failure (default: 3). Failed segments are re-attempted on subsequent polls while still in the CDN window. |
 | `--help` | `-h` | Show help message. |
 
 Both `--key value` and `--key=value` forms are accepted.
@@ -94,6 +98,16 @@ webvttdl.exe --curl-opts "--socks5 127.0.0.1:1080" "https://cdn.example.com/stre
 Add retry logic and a longer timeout:
 ```bat
 webvttdl.exe --curl-opts "--retry 3 --max-time 60" "https://cdn.example.com/stream/index.m3u8"
+```
+
+Record a live stream (auto-detected, press Ctrl+C to stop):
+```bat
+webvttdl.exe "https://cdn.example.com/live/index.m3u8"
+```
+
+Record a live stream for exactly 30 minutes:
+```bat
+webvttdl.exe --duration 1800 "https://cdn.example.com/live/index.m3u8"
 ```
 
 Run on Linux with Mono:

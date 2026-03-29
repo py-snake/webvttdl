@@ -15,12 +15,19 @@ namespace webvttdl
         public string Language;     // -l / --lang <code>  (filter tracks)
         public bool NoSrt;          // --no-srt  (VTT only)
         public bool NoVtt;          // --no-vtt  (SRT only, VTT not kept)
+        public bool LiveMode;       // --live   (force live recording mode)
+        public int Duration;        // --duration <sec>  (0 = unlimited)
+        public int PollInterval;    // --poll <sec>  (0 = use EXT-X-TARGETDURATION)
+        public int Retries;         // --retries <n>  (per-segment retry attempts, default 3)
         public bool Help;           // -h / --help
         public string Error;        // set on parse failure
     }
 
     class Program
     {
+        // Set to true by the Ctrl+C handler; checked in the live poll loop.
+        private static volatile bool _cancelled = false;
+
         static int Main(string[] args)
         {
             Console.OutputEncoding = new UTF8Encoding(false);
@@ -99,6 +106,14 @@ namespace webvttdl
                 Log("Language:     " + opts.Language);
             Log("Output dir:   " + outDir);
 
+            // Register Ctrl+C handler once for live mode graceful stop.
+            Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e)
+            {
+                e.Cancel = true;   // prevent immediate process termination
+                _cancelled = true;
+                Console.Error.WriteLine("\n  [Ctrl+C -- stopping after current segment...]");
+            };
+
             return Download(opts, curl, outDir);
         }
 
@@ -166,8 +181,37 @@ namespace webvttdl
                     continue;
                 }
 
-                List<string> segmentUrls = M3u8Parser.ParseMediaPlaylist(
+                var playlistInfo = M3u8Parser.ParseMediaPlaylistInfo(
                     playlistContent, track.ResolvedPlaylistUrl);
+
+                // Determine output base name.
+                // --output overrides; if multiple tracks are present, append _<lang> to avoid collision.
+                string baseName;
+                if (!string.IsNullOrEmpty(opts.OutputName))
+                {
+                    baseName = (tracks.Count > 1)
+                        ? opts.OutputName + "_" + SanitizeFilenameAscii(track.Language)
+                        : opts.OutputName;
+                }
+                else
+                {
+                    baseName = GetBaseNameFromUri(track.Uri);
+                }
+
+                bool isLive = opts.LiveMode || playlistInfo.IsLive;
+
+                if (isLive)
+                {
+                    Log(string.Format("  Live stream detected (target duration: {0}s).",
+                        playlistInfo.TargetDuration));
+                    int liveResult = DownloadLive(opts, curl, outDir, track, baseName, playlistInfo);
+                    if (liveResult != 0)
+                        Console.Error.WriteLine("  WARNING: Live capture ended with errors.");
+                    continue;
+                }
+
+                // --- VOD path ---
+                List<string> segmentUrls = playlistInfo.SegmentUrls;
 
                 Log(string.Format("  Found {0} segment(s)", segmentUrls.Count));
 
@@ -208,20 +252,6 @@ namespace webvttdl
                 Log(string.Format("  Downloaded {0}/{1} segments.",
                     segmentContents.Count, segmentUrls.Count));
 
-                // Determine output base name.
-                // --output overrides; if multiple tracks are present, append _<lang> to avoid collision.
-                string baseName;
-                if (!string.IsNullOrEmpty(opts.OutputName))
-                {
-                    baseName = (tracks.Count > 1)
-                        ? opts.OutputName + "_" + SanitizeFilenameAscii(track.Language)
-                        : opts.OutputName;
-                }
-                else
-                {
-                    baseName = GetBaseNameFromUri(track.Uri);
-                }
-
                 string vttPath = Path.Combine(outDir, baseName + ".vtt");
                 string srtPath = Path.Combine(outDir, baseName + ".srt");
 
@@ -248,6 +278,211 @@ namespace webvttdl
         }
 
         // -------------------------------------------------------------------------
+        // Live stream recording loop
+        // -------------------------------------------------------------------------
+
+        static int DownloadLive(CliArgs opts, CurlDownloader curl, string outDir,
+                                SubtitleTrack track, string baseName,
+                                MediaPlaylistInfo initialInfo)
+        {
+            string vttPath = Path.Combine(outDir, baseName + ".vtt");
+            string srtPath = Path.Combine(outDir, baseName + ".srt");
+
+            var merger = new WebVttMerger.IncrementalMerger();
+
+            // Total segment counter (for status display and final summary).
+            int totalSegments = 0;
+
+            // Highest sequence number already downloaded (-1 = none yet).
+            long lastSeenSeq = -1;
+
+            // Segments that failed all inline retries: seqNum -> url.
+            // Retried at the start of each poll while still within the CDN window.
+            var retryQueue = new Dictionary<long, string>();
+
+            int maxRetries = opts.Retries > 0 ? opts.Retries : 3;
+
+            DateTime? stopAt = opts.Duration > 0
+                ? (DateTime?)DateTime.UtcNow.AddSeconds(opts.Duration)
+                : null;
+
+            Log("  Live mode -- press Ctrl+C to stop.");
+            if (stopAt.HasValue)
+                Log(string.Format("  Auto-stop after {0}s.", opts.Duration));
+
+            MediaPlaylistInfo info = initialInfo;
+            bool firstPoll = true;
+
+            while (!_cancelled)
+            {
+                if (stopAt.HasValue && DateTime.UtcNow >= stopAt.Value)
+                {
+                    Console.WriteLine();
+                    Log("  Duration limit reached.");
+                    break;
+                }
+
+                if (!firstPoll)
+                {
+                    string playlistContent = curl.DownloadString(track.ResolvedPlaylistUrl);
+                    if (playlistContent == null)
+                    {
+                        Console.Error.WriteLine("\n  WARNING: Failed to refresh playlist, retrying...");
+                        SleepCancellable(2000);
+                        continue;
+                    }
+                    info = M3u8Parser.ParseMediaPlaylistInfo(playlistContent, track.ResolvedPlaylistUrl);
+                }
+                firstPoll = false;
+
+                // --- Retry queue: re-attempt previously failed segments still in window ---
+                if (retryQueue.Count > 0)
+                {
+                    long windowStart = info.FirstSequenceNumber;
+                    var expired = new List<long>();
+                    foreach (long seq in retryQueue.Keys)
+                        if (seq < windowStart) expired.Add(seq);
+                    foreach (long seq in expired)
+                    {
+                        Console.Error.WriteLine(string.Format(
+                            "\n  WARNING: Segment seq={0} expired from CDN window, giving up.", seq));
+                        retryQueue.Remove(seq);
+                    }
+
+                    // Sort so we insert them in order.
+                    var retrySeqs = new List<long>(retryQueue.Keys);
+                    retrySeqs.Sort();
+                    var recovered = new SortedDictionary<long, string>();
+                    foreach (long seq in retrySeqs)
+                    {
+                        if (_cancelled) break;
+                        string content = DownloadWithRetry(curl, retryQueue[seq], seq, maxRetries);
+                        if (content != null)
+                        {
+                            recovered[seq] = content;
+                            retryQueue.Remove(seq);
+                        }
+                    }
+                    if (recovered.Count > 0)
+                    {
+                        // Insert recovered segments in order before the next normal batch.
+                        var recoveredList = new List<string>(recovered.Values);
+                        totalSegments += recoveredList.Count;
+                        merger.AddSegments(recoveredList);
+                        Console.Write(string.Format(
+                            "\r  Recovered {0} queued segment(s) | cues: {1}    ",
+                            recovered.Count, merger.CueCount));
+                    }
+                }
+
+                // --- Download any segments whose sequence number we haven't seen yet ---
+                var newBatch = new List<string>();
+                for (int j = 0; j < info.SegmentUrls.Count && !_cancelled; j++)
+                {
+                    long seqNum = info.FirstSequenceNumber + j;
+                    if (seqNum <= lastSeenSeq)
+                        continue;
+
+                    string segContent = DownloadWithRetry(curl, info.SegmentUrls[j], seqNum, maxRetries);
+                    if (segContent == null)
+                    {
+                        // Still failing after all retries — queue for next poll attempt.
+                        retryQueue[seqNum] = info.SegmentUrls[j];
+                    }
+                    else
+                    {
+                        newBatch.Add(segContent);
+                    }
+                    // Advance lastSeenSeq so we don't re-attempt via normal path.
+                    lastSeenSeq = seqNum;
+                }
+
+                if (newBatch.Count > 0)
+                {
+                    totalSegments += newBatch.Count;
+                    merger.AddSegments(newBatch);
+
+                    Console.Write(string.Format(
+                        "\r  +{0} segment(s) | total: {1} | cues: {2} | last seq: {3}    ",
+                        newBatch.Count, totalSegments, merger.CueCount, lastSeenSeq));
+
+                    // Only process new segments; emit accumulated cues.
+                    string mergedVtt = merger.ToVtt();
+                    if (!opts.NoVtt)
+                        File.WriteAllText(vttPath, mergedVtt, new UTF8Encoding(false));
+                    if (!opts.NoSrt)
+                        WebVttToSrtConverter.Convert(mergedVtt, srtPath);
+                }
+
+                // If the server sent EXT-X-ENDLIST the stream has ended.
+                if (!info.IsLive && !opts.LiveMode)
+                {
+                    Console.WriteLine();
+                    Log("  Stream ended (EXT-X-ENDLIST received).");
+                    break;
+                }
+
+                if (_cancelled)
+                    break;
+
+                // Sleep until next playlist refresh, waking every 250 ms to check for cancellation.
+                int sleepMs = (opts.PollInterval > 0 ? opts.PollInterval : info.TargetDuration) * 1000;
+                SleepCancellable(sleepMs);
+            }
+
+            Console.WriteLine();
+
+            if (totalSegments == 0)
+            {
+                Console.Error.WriteLine("  No segments captured.");
+                return 1;
+            }
+
+            Log(string.Format("  Captured {0} segment(s), {1} cues.", totalSegments, merger.CueCount));
+            if (!opts.NoVtt) Log("  VTT -> " + vttPath);
+            if (!opts.NoSrt) Log("  SRT -> " + srtPath);
+            return 0;
+        }
+
+        // Downloads a URL with up to maxAttempts tries, sleeping 1s between each.
+        // Returns null only if all attempts fail.
+        static string DownloadWithRetry(CurlDownloader curl, string url, long seqNum, int maxAttempts)
+        {
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                string content = curl.DownloadString(url);
+                if (content != null)
+                    return content;
+
+                if (attempt < maxAttempts)
+                {
+                    Console.Error.WriteLine(string.Format(
+                        "\n  WARNING: Segment seq={0} failed (attempt {1}/{2}), retrying in 1s...",
+                        seqNum, attempt, maxAttempts));
+                    System.Threading.Thread.Sleep(1000);
+                }
+                else
+                {
+                    Console.Error.WriteLine(string.Format(
+                        "\n  WARNING: Segment seq={0} failed after {1} attempts, queuing for retry.",
+                        seqNum, maxAttempts));
+                }
+            }
+            return null;
+        }
+
+        // Sleeps for up to totalMs milliseconds, waking every 250 ms to check _cancelled.
+        static void SleepCancellable(int totalMs)
+        {
+            int waited = 0;
+            while (waited < totalMs && !_cancelled)
+            {
+                System.Threading.Thread.Sleep(250);
+                waited += 250;
+            }
+        }
+
+        // -------------------------------------------------------------------------
         // Argument parser
         // -------------------------------------------------------------------------
 
@@ -269,6 +504,7 @@ namespace webvttdl
                 // Flags with no value
                 if (a == "--no-srt") { opts.NoSrt = true; continue; }
                 if (a == "--no-vtt") { opts.NoVtt = true; continue; }
+                if (a == "--live")   { opts.LiveMode = true; continue; }
 
                 // Options that take a value — support both "--key value" and "--key=value"
                 string key = null, val = null;
@@ -328,6 +564,24 @@ namespace webvttdl
                             opts.CurlOpts = val;
                             break;
 
+                        case "--duration":
+                            if (val == null) { opts.Error = "--duration requires a value."; return opts; }
+                            if (!int.TryParse(val, out opts.Duration) || opts.Duration <= 0)
+                            { opts.Error = "--duration must be a positive integer (seconds)."; return opts; }
+                            break;
+
+                        case "--poll":
+                            if (val == null) { opts.Error = "--poll requires a value."; return opts; }
+                            if (!int.TryParse(val, out opts.PollInterval) || opts.PollInterval <= 0)
+                            { opts.Error = "--poll must be a positive integer (seconds)."; return opts; }
+                            break;
+
+                        case "--retries":
+                            if (val == null) { opts.Error = "--retries requires a value."; return opts; }
+                            if (!int.TryParse(val, out opts.Retries) || opts.Retries < 1)
+                            { opts.Error = "--retries must be a positive integer."; return opts; }
+                            break;
+
                         default:
                             opts.Error = "Unknown option: " + key;
                             return opts;
@@ -373,6 +627,14 @@ namespace webvttdl
             Console.WriteLine("                            Useful for proxies, auth, timeouts, retries, etc.");
             Console.WriteLine("      --no-srt              Output VTT only; skip SRT conversion.");
             Console.WriteLine("      --no-vtt              Output SRT only; do not write the VTT file.");
+            Console.WriteLine("      --live                Force live recording mode.");
+            Console.WriteLine("                            Normally auto-detected from the playlist.");
+            Console.WriteLine("      --duration <sec>      Stop live recording after N seconds.");
+            Console.WriteLine("      --poll <sec>          Playlist refresh interval for live mode.");
+            Console.WriteLine("                            Default: EXT-X-TARGETDURATION from the playlist.");
+            Console.WriteLine("      --retries <n>         Per-segment download retry attempts (default: 3).");
+            Console.WriteLine("                            Failed segments are also queued across polls");
+            Console.WriteLine("                            until they expire from the CDN window.");
             Console.WriteLine("  -h, --help                Show this help message.");
             Console.WriteLine();
             Console.WriteLine("Examples:");
