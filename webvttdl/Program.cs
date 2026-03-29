@@ -101,6 +101,9 @@ namespace webvttdl
                 return 1;
             }
 
+            // Timestamp prefix computed once so all files from this run share it.
+            string runStamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
             Log("Master URL:   " + opts.Url);
             if (!string.IsNullOrEmpty(opts.Language))
                 Log("Language:     " + opts.Language);
@@ -121,14 +124,14 @@ namespace webvttdl
                 Console.Error.WriteLine("\n  [Ctrl+C -- stopping after current segment... press again to force exit]");
             };
 
-            return Download(opts, curl, outDir);
+            return Download(opts, curl, outDir, runStamp);
         }
 
         // -------------------------------------------------------------------------
         // Core download pipeline
         // -------------------------------------------------------------------------
 
-        static int Download(CliArgs opts, CurlDownloader curl, string outDir)
+        static int Download(CliArgs opts, CurlDownloader curl, string outDir, string runStamp)
         {
             Log("Downloading master playlist...");
             string masterContent = curl.DownloadString(opts.Url);
@@ -205,13 +208,16 @@ namespace webvttdl
                     baseName = GetBaseNameFromUri(track.Uri);
                 }
 
+                // Prepend run timestamp so every invocation produces unique filenames.
+                string stampedBaseName = runStamp + "_" + baseName;
+
                 bool isLive = opts.LiveMode || playlistInfo.IsLive;
 
                 if (isLive)
                 {
                     Log(string.Format("  Live stream detected (target duration: {0}s).",
                         playlistInfo.TargetDuration));
-                    int liveResult = DownloadLive(opts, curl, outDir, track, baseName, playlistInfo);
+                    int liveResult = DownloadLive(opts, curl, outDir, track, stampedBaseName, playlistInfo);
                     if (liveResult != 0)
                         Console.Error.WriteLine("  WARNING: Live capture ended with errors.");
                     continue;
@@ -266,8 +272,8 @@ namespace webvttdl
                 Log(string.Format("  Downloaded {0}/{1} segments.",
                     segmentContents.Count, segmentUrls.Count));
 
-                string vttPath = Path.Combine(outDir, baseName + ".vtt");
-                string srtPath = Path.Combine(outDir, baseName + ".srt");
+                string vttPath = Path.Combine(outDir, stampedBaseName + ".vtt");
+                string srtPath = Path.Combine(outDir, stampedBaseName + ".srt");
 
                 // Merge all segments in RAM.
                 string mergedVtt = WebVttMerger.Merge(segmentContents);
