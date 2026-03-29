@@ -106,12 +106,19 @@ namespace webvttdl
                 Log("Language:     " + opts.Language);
             Log("Output dir:   " + outDir);
 
-            // Register Ctrl+C handler once for live mode graceful stop.
+            // First Ctrl+C: set cancel flag (graceful stop after current segment).
+            // Second Ctrl+C: exit immediately without saving.
             Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e)
             {
-                e.Cancel = true;   // prevent immediate process termination
+                if (_cancelled)
+                {
+                    // Already cancelling — force exit now.
+                    Console.Error.WriteLine("\n  [Ctrl+C again -- force exit, no files saved.]");
+                    System.Environment.Exit(1);
+                }
+                e.Cancel = true;
                 _cancelled = true;
-                Console.Error.WriteLine("\n  [Ctrl+C -- stopping after current segment...]");
+                Console.Error.WriteLine("\n  [Ctrl+C -- stopping after current segment... press again to force exit]");
             };
 
             return Download(opts, curl, outDir);
@@ -225,7 +232,7 @@ namespace webvttdl
                 int maxRetries = opts.Retries > 0 ? opts.Retries : 3;
                 var segmentContents = new List<string>(segmentUrls.Count);
                 int failed = 0;
-                for (int j = 0; j < segmentUrls.Count; j++)
+                for (int j = 0; j < segmentUrls.Count && !_cancelled; j++)
                 {
                     Console.Write(string.Format(
                         "\r  Downloading segment {0}/{1}...    ", j + 1, segmentUrls.Count));
@@ -239,6 +246,12 @@ namespace webvttdl
                     segmentContents.Add(segContent);
                 }
                 Console.WriteLine();
+
+                if (_cancelled)
+                {
+                    Console.Error.WriteLine("  Cancelled.");
+                    continue;
+                }
 
                 if (segmentContents.Count == 0)
                 {
