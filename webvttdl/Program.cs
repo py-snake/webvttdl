@@ -102,7 +102,7 @@ namespace webvttdl
             }
 
             // Timestamp prefix computed once so all files from this run share it.
-            string runStamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string runStamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
 
             Log("Master URL:   " + opts.Url);
             if (!string.IsNullOrEmpty(opts.Language))
@@ -460,9 +460,10 @@ namespace webvttdl
                         WebVttToSrtConverter.Convert(mergedVtt, srtPath);
 
                     Console.Write(string.Format(
-                        "\r  +{0} seg | total: {1} | cues: {2} | seq: {3} | queued: {4}    ",
+                        "\r  +{0} seg | total: {1} | cues: {2} | seq: {3} | queued: {4} | {5} | {6}    ",
                         flushBatch.Count, totalSegments, merger.CueCount,
-                        lastFlushedSeq, retryQueue.Count));
+                        lastFlushedSeq, retryQueue.Count,
+                        merger.LastCueEndTime, merger.LastCueText));
                 }
 
                 // If the server sent EXT-X-ENDLIST the stream has ended.
@@ -508,7 +509,7 @@ namespace webvttdl
                     Console.Error.WriteLine(string.Format(
                         "\n  WARNING: Segment seq={0} failed (attempt {1}/{2}), retrying in 1s...",
                         seqNum, attempt, maxAttempts));
-                    System.Threading.Thread.Sleep(1000);
+                    SleepCancellable(1000);
                 }
                 else
                 {
@@ -543,96 +544,107 @@ namespace webvttdl
             {
                 string a = args[i];
 
-                // -h / --help
+                // Help
                 if (a == "-h" || a == "--help")
-                {
-                    opts.Help = true;
-                    return opts;
-                }
+                { opts.Help = true; return opts; }
 
-                // Flags with no value
+                // Value-less flags — handled before the value-consuming branch so
+                // they are never mistaken for option names that need a value.
                 if (a == "--no-srt") { opts.NoSrt = true; continue; }
                 if (a == "--no-vtt") { opts.NoVtt = true; continue; }
                 if (a == "--live")   { opts.LiveMode = true; continue; }
 
-                // Options that take a value — support both "--key value" and "--key=value"
-                string key = null, val = null;
-
-                if (a.StartsWith("--") && a.Contains("="))
+                // Named options: support both "-k value"/"--key value" and "-k=value"/"--key=value".
+                if (a.StartsWith("-"))
                 {
+                    string key, val;
                     int eq = a.IndexOf('=');
-                    key = a.Substring(0, eq);
-                    val = a.Substring(eq + 1);
-                }
-                else if (a.StartsWith("-"))
-                {
-                    key = a;
-                    // Always consume the next arg as the value for options that require one.
-                    // (Valueless flags like --no-srt/--help are handled above and never reach here.)
-                    if (i + 1 < args.Length)
-                    {
-                        val = args[i + 1];
-                        i++;
-                    }
-                }
 
-                if (key != null)
-                {
+                    if (eq > 0)
+                    {
+                        // "--key=value" or "-k=value" form
+                        key = a.Substring(0, eq);
+                        val = a.Substring(eq + 1);
+                        // Boolean flags never take a value.
+                        if (key == "--no-srt" || key == "--no-vtt" || key == "--live")
+                        {
+                            opts.Error = string.Format(
+                                "'{0}' is a flag and does not accept a value.", key);
+                            return opts;
+                        }
+                        if (val.Length == 0)
+                        {
+                            opts.Error = string.Format(
+                                "'{0}' requires a non-empty value. Use: {0} <value> or {0}=<value>", key);
+                            return opts;
+                        }
+                    }
+                    else
+                    {
+                        // "--key value" or "-k value" form — consume next arg as value
+                        key = a;
+                        if (i + 1 >= args.Length)
+                        {
+                            opts.Error = string.Format("'{0}' requires a value.", key);
+                            return opts;
+                        }
+                        val = args[++i];
+                    }
+
+                    // Strip surrounding matching quotes that Windows CMD passes through
+                    // literally when the user wraps a value in single quotes, e.g.
+                    // --lang 'hu' or --duration '01:10:00'.
+                    // Double quotes are normally stripped by CMD itself, but handle
+                    // them here too for symmetry (Mono/Wine edge cases).
+                    if (val.Length >= 2 &&
+                        ((val[0] == '\'' && val[val.Length - 1] == '\'') ||
+                         (val[0] == '"'  && val[val.Length - 1] == '"')))
+                        val = val.Substring(1, val.Length - 2);
+
                     switch (key)
                     {
                         case "-o":
                         case "--output":
-                            if (val == null) { opts.Error = "--output requires a value."; return opts; }
                             opts.OutputName = SanitizeFilenameAscii(val);
                             if (string.IsNullOrEmpty(opts.OutputName))
-                            {
-                                opts.Error = "--output value contains no valid filename characters.";
-                                return opts;
-                            }
+                            { opts.Error = "--output: '" + val + "' contains no valid ASCII filename characters."; return opts; }
                             break;
 
                         case "-d":
                         case "--output-dir":
-                            if (val == null) { opts.Error = "--output-dir requires a value."; return opts; }
                             opts.OutputDir = val;
                             break;
 
                         case "-l":
                         case "--lang":
-                            if (val == null) { opts.Error = "--lang requires a value."; return opts; }
                             opts.Language = val;
                             break;
 
                         case "--curl":
-                            if (val == null) { opts.Error = "--curl requires a value."; return opts; }
                             opts.CurlPath = val;
                             break;
 
                         case "--curl-opts":
-                            if (val == null) { opts.Error = "--curl-opts requires a value."; return opts; }
                             opts.CurlOpts = val;
                             break;
 
                         case "--duration":
-                            if (val == null) { opts.Error = "--duration requires a value."; return opts; }
-                            if (!int.TryParse(val, out opts.Duration) || opts.Duration <= 0)
-                            { opts.Error = "--duration must be a positive integer (seconds)."; return opts; }
+                            if (!TryParseDuration(val, out opts.Duration) || opts.Duration <= 0)
+                            { opts.Error = "--duration: expected seconds (e.g. 3600) or HH:MM:SS (e.g. 01:10:00), got '" + val + "'."; return opts; }
                             break;
 
                         case "--poll":
-                            if (val == null) { opts.Error = "--poll requires a value."; return opts; }
                             if (!int.TryParse(val, out opts.PollInterval) || opts.PollInterval <= 0)
-                            { opts.Error = "--poll must be a positive integer (seconds)."; return opts; }
+                            { opts.Error = "--poll: expected a positive integer (seconds), got '" + val + "'."; return opts; }
                             break;
 
                         case "--retries":
-                            if (val == null) { opts.Error = "--retries requires a value."; return opts; }
                             if (!int.TryParse(val, out opts.Retries) || opts.Retries < 1)
-                            { opts.Error = "--retries must be a positive integer."; return opts; }
+                            { opts.Error = "--retries: expected a positive integer, got '" + val + "'."; return opts; }
                             break;
 
                         default:
-                            opts.Error = "Unknown option: " + key;
+                            opts.Error = "Unknown option: '" + key + "'. Run with --help for usage.";
                             return opts;
                     }
                     continue;
@@ -643,12 +655,37 @@ namespace webvttdl
                     opts.Url = a;
                 else
                 {
-                    opts.Error = "Unexpected argument: " + a;
+                    opts.Error = "Unexpected argument: '" + a + "'. Only one URL is accepted.";
                     return opts;
                 }
             }
 
             return opts;
+        }
+
+        // Parses a duration string: plain integer seconds OR HH:MM:SS.
+        // Returns false on parse failure.
+        static bool TryParseDuration(string val, out int seconds)
+        {
+            seconds = 0;
+            if (string.IsNullOrEmpty(val))
+                return false;
+
+            if (val.IndexOf(':') >= 0)
+            {
+                // HH:MM:SS format
+                string[] parts = val.Split(':');
+                if (parts.Length != 3)
+                    return false;
+                int h, m, s;
+                if (!int.TryParse(parts[0], out h) || h < 0)  return false;
+                if (!int.TryParse(parts[1], out m) || m < 0 || m > 59) return false;
+                if (!int.TryParse(parts[2], out s) || s < 0 || s > 59) return false;
+                seconds = h * 3600 + m * 60 + s;
+                return true;
+            }
+
+            return int.TryParse(val, out seconds);
         }
 
         // -------------------------------------------------------------------------
@@ -678,7 +715,8 @@ namespace webvttdl
             Console.WriteLine("      --no-vtt              Output SRT only; do not write the VTT file.");
             Console.WriteLine("      --live                Force live recording mode.");
             Console.WriteLine("                            Normally auto-detected from the playlist.");
-            Console.WriteLine("      --duration <sec>      Stop live recording after N seconds.");
+            Console.WriteLine("      --duration <time>     Stop live recording after the given duration.");
+            Console.WriteLine("                            Accepts seconds (e.g. 3600) or HH:MM:SS (e.g. 01:10:00).");
             Console.WriteLine("      --poll <sec>          Playlist refresh interval for live mode.");
             Console.WriteLine("                            Default: EXT-X-TARGETDURATION from the playlist.");
             Console.WriteLine("      --retries <n>         Per-segment download retry attempts (default: 3).");
@@ -693,6 +731,10 @@ namespace webvttdl
             Console.WriteLine("  webvttdl.exe --curl C:\\tools\\curl.exe \"https://cdn.example.com/index.m3u8\"");
             Console.WriteLine("  webvttdl.exe --curl-opts \"-x http://proxy:8080\" \"https://cdn.example.com/index.m3u8\"");
             Console.WriteLine("  webvttdl.exe --curl-opts \"--retry 3 --max-time 60\" \"https://cdn.example.com/index.m3u8\"");
+            Console.WriteLine("  webvttdl.exe --live \"https://cdn.example.com/live/index.m3u8\"");
+            Console.WriteLine("  webvttdl.exe --live --duration 3600 \"https://cdn.example.com/live/index.m3u8\"");
+            Console.WriteLine("  webvttdl.exe --live --duration 01:10:00 \"https://cdn.example.com/live/index.m3u8\"");
+            Console.WriteLine("  webvttdl.exe --live --poll 4 --retries 5 \"https://cdn.example.com/live/index.m3u8\"");
             Console.WriteLine();
             Console.WriteLine("Notes:");
             Console.WriteLine("  curl.exe must be available. Place it next to webvttdl.exe or add it to PATH.");

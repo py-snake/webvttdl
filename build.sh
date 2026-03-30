@@ -56,6 +56,14 @@ cat > "$OUTPUT_DIR/webvttdl.exe.config" << 'EOF'
 </configuration>
 EOF
 
+CURL_DIR="$PROJECT_DIR/bin/curl"
+if [ -d "$CURL_DIR" ]; then
+    echo "Copying curl files from $CURL_DIR..."
+    cp "$CURL_DIR"/* "$OUTPUT_DIR/"
+else
+    echo "WARNING: $CURL_DIR not found, skipping curl copy."
+fi
+
 echo ""
 echo "Build successful!"
 echo ""

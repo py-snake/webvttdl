@@ -52,12 +52,7 @@ namespace webvttdl
             {
                 long offsetMs = 0;
                 if (hasTsMap[i])
-                {
-                    // offset_ms = (MPEGTS_N - MPEGTS_0) / 90  +  local_0_ms - local_N_ms
-                    // MPEG-TS clock is 90 kHz → divide by 90 to get milliseconds.
-                    offsetMs = (long)Math.Round((double)(mpegTs[i] - baseMpegTs) / 90.0)
-                               + baseLocalMs - localMs[i];
-                }
+                    offsetMs = ComputeOffsetMs(mpegTs[i], baseMpegTs, localMs[i], baseLocalMs);
 
                 string cues = ExtractCues(segmentContents[i]);
                 if (string.IsNullOrEmpty(cues))
@@ -196,6 +191,44 @@ namespace webvttdl
 
             public int CueCount { get { return _cues.Count; } }
 
+            // End timestamp of the last cue as HH:MM:SS (empty string if no cues yet).
+            public string LastCueEndTime
+            {
+                get
+                {
+                    if (_cues.Count == 0) return string.Empty;
+                    long ms = _cues[_cues.Count - 1].EndMs;
+                    long h = ms / 3600000L; ms %= 3600000L;
+                    long m = ms / 60000L;   ms %= 60000L;
+                    long s = ms / 1000L;
+                    return string.Format("{0:D2}:{1:D2}:{2:D2}", h, m, s);
+                }
+            }
+
+            // Plain text of the last cue, VTT tags stripped, first line only,
+            // truncated to 40 characters for the status line.
+            public string LastCueText
+            {
+                get
+                {
+                    if (_cues.Count == 0) return string.Empty;
+                    string text = _cues[_cues.Count - 1].Text;
+                    // Take only the first line.
+                    int nl = text.IndexOf('\n');
+                    if (nl >= 0) text = text.Substring(0, nl);
+                    // Strip all <...> tags.
+                    text = Regex.Replace(text, @"<[^>]*>", string.Empty).Trim();
+                    // Transliterate non-ASCII characters for safe display on
+                    // Windows/Wine consoles using CP437/CP1252.
+                    var sb = new StringBuilder(text.Length);
+                    foreach (char c in text)
+                        sb.Append(TransliterateChar(c));
+                    text = sb.ToString().Trim();
+                    if (text.Length > 40) text = text.Substring(0, 37) + "...";
+                    return text;
+                }
+            }
+
             // Processes a batch of new segment content strings and appends their
             // cues to the internal list.  Returns the number of cues added.
             public int AddSegments(List<string> segments)
@@ -224,8 +257,7 @@ namespace webvttdl
                     {
                         long pts, loc;
                         if (TryParseMpegTsMap(seg, out pts, out loc))
-                            offsetMs = (long)Math.Round((double)(pts - _baseMpegTs) / 90.0)
-                                       + _baseLocalMs - loc;
+                            offsetMs = ComputeOffsetMs(pts, _baseMpegTs, loc, _baseLocalMs);
                     }
 
                     string raw = ExtractCues(seg);
@@ -375,6 +407,68 @@ namespace webvttdl
                     sb.Append('\n');
             }
             return sb.ToString();
+        }
+
+        // Transliterates a single character to its ASCII equivalent.
+        // Covers Hungarian accented letters and common European diacritics.
+        private static char TransliterateChar(char c)
+        {
+            switch (c)
+            {
+                case 'á': case 'à': case 'â': case 'ä': case 'ã': case 'å': return 'a';
+                case 'Á': case 'À': case 'Â': case 'Ä': case 'Ã': case 'Å': return 'A';
+                case 'é': case 'è': case 'ê': case 'ë':                      return 'e';
+                case 'É': case 'È': case 'Ê': case 'Ë':                      return 'E';
+                case 'í': case 'ì': case 'î': case 'ï':                      return 'i';
+                case 'Í': case 'Ì': case 'Î': case 'Ï':                      return 'I';
+                case 'ó': case 'ò': case 'ô': case 'õ': case 'ö': case 'ő': return 'o';
+                case 'Ó': case 'Ò': case 'Ô': case 'Õ': case 'Ö': case 'Ő': return 'O';
+                case 'ú': case 'ù': case 'û': case 'ü': case 'ű':            return 'u';
+                case 'Ú': case 'Ù': case 'Û': case 'Ü': case 'Ű':            return 'U';
+                case 'ý': case 'ÿ':                                           return 'y';
+                case 'Ý':                                                      return 'Y';
+                case 'ç': case 'č': case 'ć':                                 return 'c';
+                case 'Ç': case 'Č': case 'Ć':                                 return 'C';
+                case 'ñ': case 'ń':                                            return 'n';
+                case 'Ñ': case 'Ń':                                            return 'N';
+                case 'š': case 'ś':                                            return 's';
+                case 'Š': case 'Ś':                                            return 'S';
+                case 'ž': case 'ź': case 'ż':                                  return 'z';
+                case 'Ž': case 'Ź': case 'Ż':                                  return 'Z';
+                case 'ř':                                                       return 'r';
+                case 'Ř':                                                       return 'R';
+                case 'ď':                                                       return 'd';
+                case 'Ď':                                                       return 'D';
+                case 'ť':                                                       return 't';
+                case 'Ť':                                                       return 'T';
+                case 'ľ': case 'ĺ':                                            return 'l';
+                case 'Ľ': case 'Ĺ':                                            return 'L';
+                default: return c < 128 ? c : '?';
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // MPEG-TS offset helper
+        // -------------------------------------------------------------------------
+
+        // Computes the absolute cue offset in milliseconds given per-segment MPEGTS/LOCAL
+        // values and the base values from the first segment.
+        //
+        // The MPEG-TS PTS clock is 33-bit and wraps at 2^33 = 8,589,934,592 ticks
+        // (~26.5 hours).  If a long-running stream crosses the wrap boundary during
+        // recording, the raw difference becomes a large negative number and all
+        // subsequent cues clamp to 00:00:00.  We detect the rollover by comparing
+        // the difference against half the 33-bit range and adjust accordingly.
+        private static long ComputeOffsetMs(long mpegTs, long baseMpegTs, long localMs, long baseLocalMs)
+        {
+            const long wrap     = 8589934592L; // 2^33
+            const long halfWrap = wrap / 2;
+
+            long diff = mpegTs - baseMpegTs;
+            if      (diff < -halfWrap) diff += wrap;  // forward rollover
+            else if (diff >  halfWrap) diff -= wrap;  // backward rollover (shouldn't happen, but safe)
+
+            return (long)Math.Round((double)diff / 90.0) + baseLocalMs - localMs;
         }
 
         // -------------------------------------------------------------------------

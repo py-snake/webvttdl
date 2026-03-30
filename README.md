@@ -56,7 +56,7 @@ webvttdl.exe [options] <master-m3u8-url>
 | `--no-srt` | | Output `.vtt` only; skip SRT conversion. |
 | `--no-vtt` | | Output `.srt` only; do not write the `.vtt` file. |
 | `--live` | | Force live recording mode (normally auto-detected). |
-| `--duration <sec>` | | Stop live recording after N seconds. |
+| `--duration <time>` | | Stop live recording after the given duration. Accepts seconds (`3600`) or `HH:MM:SS` (`01:10:00`). |
 | `--poll <sec>` | | Playlist refresh interval for live mode (default: `EXT-X-TARGETDURATION`). |
 | `--retries <n>` | | Per-segment retry attempts on network failure (default: 3). Failed segments are re-attempted on subsequent polls while still in the CDN window. |
 | `--help` | `-h` | Show help message. |
@@ -105,9 +105,10 @@ Record a live stream (auto-detected, press Ctrl+C to stop):
 webvttdl.exe "https://cdn.example.com/live/index.m3u8"
 ```
 
-Record a live stream for exactly 30 minutes:
+Record a live stream for exactly 30 minutes (seconds or HH:MM:SS both accepted):
 ```bat
 webvttdl.exe --duration 1800 "https://cdn.example.com/live/index.m3u8"
+webvttdl.exe --duration 00:30:00 "https://cdn.example.com/live/index.m3u8"
 ```
 
 Run on Linux with Mono:

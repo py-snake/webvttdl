@@ -79,8 +79,17 @@ namespace webvttdl
             var proc = new Process { StartInfo = psi };
             proc.Start();
 
+            // Read stdout and stderr concurrently to prevent deadlock:
+            // if one pipe's OS buffer fills while the other is still being
+            // drained the process would block and never exit.
+            string stderr = null;
+            var stderrThread = new System.Threading.Thread(
+                () => { stderr = proc.StandardError.ReadToEnd(); });
+            stderrThread.IsBackground = true;
+            stderrThread.Start();
+
             string stdout = proc.StandardOutput.ReadToEnd();
-            string stderr = proc.StandardError.ReadToEnd();
+            stderrThread.Join();
             proc.WaitForExit();
 
             return new CurlResult

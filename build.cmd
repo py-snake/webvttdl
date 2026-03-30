@@ -39,6 +39,13 @@ echo   ^</startup^>
 echo ^</configuration^>
 ) > "bin\%CONFIG%\webvttdl.exe.config"
 
+if exist "bin\curl" (
+    echo Copying curl files...
+    copy /Y "bin\curl\*" "bin\%CONFIG%\" > nul
+) else (
+    echo WARNING: bin\curl folder not found, skipping curl copy.
+)
+
 echo Build successful!
 echo Output: %~dp0webvttdl\bin\%CONFIG%\
 echo.
