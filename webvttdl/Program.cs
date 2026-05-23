@@ -30,8 +30,6 @@ namespace webvttdl
 
         static int Main(string[] args)
         {
-            Console.OutputEncoding = new UTF8Encoding(false);
-
             try
             {
                 return Run(args);
@@ -102,7 +100,7 @@ namespace webvttdl
             }
 
             // Timestamp prefix computed once so all files from this run share it.
-            string runStamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            string runStamp = DateTime.Now.ToString("yyyy.MM.dd-HH.mm.ss");
 
             Log("Master URL:   " + opts.Url);
             if (!string.IsNullOrEmpty(opts.Language))
@@ -218,22 +216,30 @@ namespace webvttdl
                 var playlistInfo = M3u8Parser.ParseMediaPlaylistInfo(
                     playlistContent, track.ResolvedPlaylistUrl);
 
-                // Determine output base name.
-                // --output overrides; if multiple tracks are present, append _<lang> to avoid collision.
-                string baseName;
-                if (!string.IsNullOrEmpty(opts.OutputName))
+                // Build the output base name according to these rules:
+                //   --output not given          → 2026.12.31-23.59.59[_lang]
+                //   --output of 1-2 chars (XX)  → 2026.12.31-23.59.59XX[_lang]
+                //   --output of 3+ chars        → specifiedname[_lang]  (no datetime)
+                string langSuffix = (tracks.Count > 1)
+                    ? "_" + SanitizeFilenameAscii(track.Language)
+                    : string.Empty;
+
+                string stampedBaseName;
+                if (!string.IsNullOrEmpty(opts.OutputName) && opts.OutputName.Length > 2)
                 {
-                    baseName = (tracks.Count > 1)
-                        ? opts.OutputName + "_" + SanitizeFilenameAscii(track.Language)
-                        : opts.OutputName;
+                    // Long explicit name: use as-is, no datetime prefix.
+                    stampedBaseName = opts.OutputName + langSuffix;
+                }
+                else if (!string.IsNullOrEmpty(opts.OutputName))
+                {
+                    // Short code (1-2 chars): datetime + code directly appended.
+                    stampedBaseName = runStamp + opts.OutputName + langSuffix;
                 }
                 else
                 {
-                    baseName = GetBaseNameFromUri(track.Uri);
+                    // No name given: just the datetime.
+                    stampedBaseName = runStamp + langSuffix;
                 }
-
-                // Prepend run timestamp so every invocation produces unique filenames.
-                string stampedBaseName = runStamp + "_" + baseName;
 
                 bool isLive = opts.LiveMode || playlistInfo.IsLive;
 
@@ -349,6 +355,7 @@ namespace webvttdl
             long lastSeenSeq    = initialInfo.FirstSequenceNumber - 1; // highest seq attempted
             long lastFlushedSeq = initialInfo.FirstSequenceNumber - 1; // highest seq flushed
             int  totalSegments  =  0;
+            int  lastStatusLen  =  0; // printed length of previous status line (without \r)
 
             DateTime? stopAt = opts.Duration > 0
                 ? (DateTime?)DateTime.UtcNow.AddSeconds(opts.Duration)
@@ -459,11 +466,16 @@ namespace webvttdl
                     if (!opts.NoSrt)
                         WebVttToSrtConverter.Convert(mergedVtt, srtPath);
 
-                    Console.Write(string.Format(
-                        "\r  +{0} seg | total: {1} | cues: {2} | seq: {3} | queued: {4} | {5} | {6}    ",
+                    string statusLine = string.Format(
+                        "  +{0} seg | total: {1} | cues: {2} | seq: {3} | queued: {4} | {5} | {6}",
                         flushBatch.Count, totalSegments, merger.CueCount,
                         lastFlushedSeq, retryQueue.Count,
-                        merger.LastCueEndTime, merger.LastCueText));
+                        merger.LastCueEndTime, merger.LastCueText);
+                    // Pad to previous line length so shorter lines fully erase longer ones.
+                    if (statusLine.Length < lastStatusLen)
+                        statusLine = statusLine.PadRight(lastStatusLen);
+                    lastStatusLen = statusLine.Length;
+                    Console.Write("\r" + statusLine);
                 }
 
                 // If the server sent EXT-X-ENDLIST the stream has ended.
@@ -701,8 +713,10 @@ namespace webvttdl
             Console.WriteLine();
             Console.WriteLine("Options:");
             Console.WriteLine("  -o, --output <name>       Output base filename (no extension).");
-            Console.WriteLine("                            Default: derived from the subtitle playlist filename.");
-            Console.WriteLine("                            If multiple tracks are downloaded, _<lang> is appended.");
+            Console.WriteLine("                            3+ chars: used as-is, e.g. mysub.vtt");
+            Console.WriteLine("                            1-2 chars: appended to datetime, e.g. 2026.12.31-23.59.59hu.vtt");
+            Console.WriteLine("                            Not given: datetime only, e.g. 2026.12.31-23.59.59.vtt");
+            Console.WriteLine("                            With multiple tracks, _<lang> is always appended.");
             Console.WriteLine("  -d, --output-dir <dir>    Directory to write output files to.");
             Console.WriteLine("                            Default: current directory. Created if missing.");
             Console.WriteLine("  -l, --lang <code>         Only download tracks matching this language code.");

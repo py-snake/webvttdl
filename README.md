@@ -9,7 +9,7 @@ Because Windows XP cannot negotiate modern TLS (1.2/1.3) required by most CDNs, 
 - Downloads all subtitle tracks from an HLS master playlist (`index.m3u8`)
 - Merges all WebVTT segments into a single `.vtt` file per track
 - Converts the merged `.vtt` to `.srt` automatically
-- Output filenames derived from the subtitle playlist name (e.g. `M2_2_..._hun_CAPT=30000.vtt`)
+- Output filenames prefixed with start datetime (e.g. `2026.12.31-23.59.59.vtt`) — no overwrites between runs
 - Filters by language, custom output name/directory, proxy support via `--curl-opts`
 - Runs on Windows XP SP3+ (.NET 4.0), Wine, and Linux/macOS (Mono)
 
@@ -48,7 +48,7 @@ webvttdl.exe [options] <master-m3u8-url>
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--output <name>` | `-o` | Output base filename without extension. Default: derived from the subtitle playlist filename. When multiple tracks are downloaded, `_<lang>` is appended automatically. |
+| `--output <name>` | `-o` | Output base filename without extension. **3+ chars**: used as-is (`mysub.vtt`). **1-2 chars**: appended to datetime (`2026.12.31-23.59.59hu.vtt`). **Not given**: datetime only (`2026.12.31-23.59.59.vtt`). With multiple tracks, `_<lang>` is always appended. |
 | `--output-dir <dir>` | `-d` | Directory to write output files to. Default: current directory. Created automatically if missing. |
 | `--lang <code>` | `-l` | Only download tracks matching this language code (e.g. `hu`, `en`). Case-insensitive. |
 | `--curl <path>` | | Explicit path to `curl.exe`. Default: auto-detected from the app directory, then `PATH`. |
@@ -118,14 +118,21 @@ mono webvttdl.exe "https://cdn.example.com/stream/index.m3u8"
 
 ## Output files
 
-For a subtitle playlist named `M2_2_20260326T..._hun_CAPT=30000.m3u8` the tool produces:
+Filenames are always prefixed with the start date and time so each run produces unique files.
 
-```
-M2_2_20260326T..._hun_CAPT=30000.vtt   (UTF-8, no BOM — per WebVTT spec)
-M2_2_20260326T..._hun_CAPT=30000.srt   (UTF-8 with BOM, CRLF — for Windows XP media players)
-```
+| Scenario | Output filename |
+|---|---|
+| No `-o` | `2026.12.31-23.59.59.vtt` |
+| `-o hu` (1-2 chars) | `2026.12.31-23.59.59hu.vtt` |
+| `-o mysub` (3+ chars) | `mysub.vtt` |
+| No `-o`, 2 tracks | `2026.12.31-23.59.59_hu.vtt` + `2026.12.31-23.59.59_en.vtt` |
+| `-o sport`, 2 tracks | `sport_hu.vtt` + `sport_en.vtt` |
 
-Filenames are sanitized to ASCII-safe characters only (`A-Z a-z 0-9 _ - = .`), so they are compatible with every filesystem including FAT32.
+Both `.vtt` and `.srt` are written unless `--no-srt` or `--no-vtt` is given:
+- `.vtt` — UTF-8 without BOM (per WebVTT spec)
+- `.srt` — UTF-8 with BOM, CRLF line endings (for Windows XP media players)
+
+Filenames are sanitized to ASCII-safe characters only (`A-Z a-z 0-9 _ - = .`), compatible with every filesystem including FAT32.
 
 ## How it works
 
